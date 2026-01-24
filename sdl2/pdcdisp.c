@@ -15,6 +15,35 @@
                            an update is forced; the number was chosen
                            arbitrarily */
 
+#ifdef PDC_WIDE
+/* Check if a Unicode code point is a wide (CJK) character that needs 2 cells */
+static int _is_wide_char(chtype ch)
+{
+    unsigned long cmp = (unsigned long)(ch & A_CHARTEXT);
+
+    /* East Asian Wide and Fullwidth characters */
+    if (cmp >= 0x1100 &&
+        (cmp <= 0x115f ||                    /* Hangul Jamo init. consonants */
+         cmp == 0x2329 ||
+         cmp == 0x232a ||
+         (cmp >= 0x2e80 && cmp <= 0x4dbf &&
+          cmp != 0x303f) ||                  /* CJK ... Yi */
+         (cmp >= 0x4e00 && cmp <= 0xa4cf) || /* CJK Unified Ideographs, Yi */
+         (cmp >= 0xa960 && cmp <= 0xa97f) || /* Hangul Jamo Extended-A */
+         (cmp >= 0xac00 && cmp <= 0xd7a3) || /* Hangul Syllables */
+         (cmp >= 0xf900 && cmp <= 0xfaff) || /* CJK Compatibility Ideographs */
+         (cmp >= 0xfe10 && cmp <= 0xfe19) || /* Vertical forms */
+         (cmp >= 0xfe30 && cmp <= 0xfe6f) || /* CJK Compatibility Forms */
+         (cmp >= 0xff00 && cmp <= 0xff60) || /* Fullwidth Forms */
+         (cmp >= 0xffe0 && cmp <= 0xffe6) ||
+         (cmp >= 0x20000 && cmp <= 0x2fffd) ||
+         (cmp >= 0x30000 && cmp <= 0x3fffd))) {
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static SDL_Rect uprect[MAXRECT];       /* table of rects to update */
 static chtype oldch = (chtype)(-1);    /* current attribute */
 static int rectcount = 0;              /* index into uprect */
@@ -249,6 +278,40 @@ bool _grprint(chtype ch, SDL_Rect dest)
 
 /* draw a cursor at (y, x) */
 
+/* Calculate pixel X position for cursor/highlight operations.
+ * Skips placeholders to match the logical column position used by Lynx. */
+static int _col_to_pixel_x_cursor(int row, int col)
+{
+    int pixel_x = 0;
+    int i;
+    chtype *line;
+
+    if (!curscr || row < 0 || row >= SP->lines || col < 0)
+        return pdc_xoffset;
+
+    line = curscr->_y[row];
+
+    for (i = 0; i < col && i < SP->cols; i++) {
+        chtype ch = line[i];
+        /* Check if this is a placeholder (second cell of wide char) */
+        if ((ch & A_CHARTEXT) == 0x00 && i > 0) {
+            /* Skip - this is the second cell of a wide character. */
+            continue;
+        }
+        pixel_x += pdc_fwidth;
+    }
+
+    return pixel_x + pdc_xoffset;
+}
+
+/* Calculate pixel X position for text drawing operations.
+ * All cells contribute to position, including placeholders. */
+static int _col_to_pixel_x_draw(int row, int col)
+{
+    (void)row;  /* Unused */
+    return col * pdc_fwidth + pdc_xoffset;
+}
+
 void PDC_gotoyx(int row, int col)
 {
     SDL_Rect src, dest;
@@ -283,7 +346,7 @@ void PDC_gotoyx(int row, int col)
     src.w = pdc_fwidth;
 
     dest.y = (row + 1) * pdc_fheight - src.h + pdc_yoffset;
-    dest.x = col * pdc_fwidth + pdc_xoffset;
+    dest.x = _col_to_pixel_x_draw(row, col);  /* Use draw version for consistency */
     dest.h = src.h;
     dest.w = src.w;
 
@@ -325,10 +388,19 @@ void PDC_gotoyx(int row, int col)
 
     if (oldrow != row || oldcol != col)
     {
+        SDL_Rect ime_rect;
+
         if (rectcount == MAXRECT)
             PDC_update_rects();
 
         uprect[rectcount++] = dest;
+
+        /* Update IME candidate window position to follow cursor */
+        ime_rect.x = _col_to_pixel_x_cursor(row, col);  /* Use cursor version */
+        ime_rect.y = row * pdc_fheight + pdc_yoffset;
+        ime_rect.w = pdc_fwidth;
+        ime_rect.h = pdc_fheight;
+        SDL_SetTextInputRect(&ime_rect);
     }
 }
 
@@ -354,7 +426,7 @@ void _new_packet(attr_t attr, int lineno, int x, int len, const chtype *srcp)
     src.w = pdc_fwidth;
 
     dest.y = pdc_fheight * lineno + pdc_yoffset;
-    dest.x = pdc_fwidth * x + pdc_xoffset;
+    dest.x = _col_to_pixel_x_draw(lineno, x);  /* Use draw version */
     dest.h = pdc_fheight;
     dest.w = pdc_fwidth * len;
 
@@ -410,28 +482,50 @@ void _new_packet(attr_t attr, int lineno, int x, int len, const chtype *srcp)
         }
 
 #ifdef PDC_WIDE
-        ch &= A_CHARTEXT;
-
-        if (ch != ' ')
         {
-            if (chstr[0] != ch)
-            {
-                chstr[0] = ch;
+            int is_wide = _is_wide_char(ch);
 
-                if (pdc_font)
-                    SDL_FreeSurface(pdc_font);
+            ch &= A_CHARTEXT;
 
-                pdc_font = TTF_RenderUNICODE_Blended(pdc_ttffont, chstr,
-                                                     pdc_color[foregr]);
+            /* Skip placeholder cells (value 0) inserted after wide characters.
+               The wide character has already drawn over this area. */
+            if (ch == 0) {
+                dest.x += pdc_fwidth;
+                continue;
             }
 
-            if (pdc_font)
+            if (ch != ' ')
             {
-                int center = pdc_fwidth > pdc_font->w ?
-                    (pdc_fwidth - pdc_font->w) >> 1 : 0;
-                dest.x += center;
-                SDL_BlitSurface(pdc_font, &src, pdc_screen, &dest);
-                dest.x -= center;
+                if (chstr[0] != ch)
+                {
+                    chstr[0] = ch;
+
+                    if (pdc_font)
+                        SDL_FreeSurface(pdc_font);
+
+                    pdc_font = TTF_RenderUNICODE_Blended(pdc_ttffont, chstr,
+                                                         pdc_color[foregr]);
+                }
+
+                if (pdc_font)
+                {
+                    if (is_wide) {
+                        /* Wide character: clear 2 cells of background first,
+                           then render the full glyph (use NULL for src to blit entire surface) */
+                        SDL_Rect wide_bg = dest;
+                        wide_bg.w = pdc_fwidth * 2;
+                        if (backgr != -1)
+                            SDL_FillRect(pdc_screen, &wide_bg, pdc_mapped[backgr]);
+                        SDL_BlitSurface(pdc_font, NULL, pdc_screen, &dest);
+                    } else {
+                        /* Narrow character: center within 1 cell */
+                        int center = pdc_fwidth > pdc_font->w ?
+                            (pdc_fwidth - pdc_font->w) >> 1 : 0;
+                        dest.x += center;
+                        SDL_BlitSurface(pdc_font, NULL, pdc_screen, &dest);
+                        dest.x -= center;
+                    }
+                }
             }
         }
 #else
@@ -556,9 +650,103 @@ void PDC_blink_text(void)
     PDC_doupdate();
 }
 
+/* Render IME composition text as overlay at cursor position */
+static void _render_composition_overlay(void)
+{
+#ifdef PDC_WIDE
+    static int last_composition_width = 0;  /* Remember previous width */
+    static int last_cursor_x = 0;
+    static int last_cursor_y = 0;
+
+    if (SP)
+    {
+        int cursor_x = SP->curscol;
+        int cursor_y = SP->cursrow;
+        int base_x = _col_to_pixel_x_cursor(cursor_y, cursor_x);  /* Use cursor version */
+        int base_y = cursor_y * pdc_fheight + pdc_yoffset;
+
+        /* Clear previous composition area if it was larger */
+        if (last_composition_width > 0)
+        {
+            int last_base_x = _col_to_pixel_x_cursor(last_cursor_y, last_cursor_x);  /* Use cursor version */
+            int last_base_y = last_cursor_y * pdc_fheight + pdc_yoffset;
+
+            /* Restore the area by redrawing from curscr */
+            int start_col = last_cursor_x;
+            int num_cols = (last_composition_width + pdc_fwidth - 1) / pdc_fwidth + 1;
+            if (start_col + num_cols > SP->cols)
+                num_cols = SP->cols - start_col;
+            if (num_cols > 0 && last_cursor_y < SP->lines)
+            {
+                PDC_transform_line(last_cursor_y, start_col, num_cols,
+                                   curscr->_y[last_cursor_y] + start_col);
+            }
+        }
+
+        if (pdc_composition_text[0])
+        {
+            SDL_Rect dest;
+            SDL_Surface *text_surface;
+            SDL_Color fg_color = {255, 255, 0, 255};  /* Yellow for composition */
+            SDL_Color bg_color = {0, 0, 128, 255};    /* Dark blue background */
+            int text_width, text_height;
+
+            dest.x = base_x;
+            dest.y = base_y;
+
+            /* Get text dimensions */
+            TTF_SizeUTF8(pdc_ttffont, pdc_composition_text, &text_width, &text_height);
+
+            /* Draw background rectangle */
+            SDL_Rect bg_rect = {dest.x, dest.y, text_width + 4, pdc_fheight};
+            SDL_FillRect(pdc_screen, &bg_rect,
+                         SDL_MapRGB(pdc_screen->format, bg_color.r, bg_color.g, bg_color.b));
+
+            /* Render composition text */
+            text_surface = TTF_RenderUTF8_Blended(pdc_ttffont, pdc_composition_text, fg_color);
+            if (text_surface)
+            {
+                dest.x += 2;  /* Small padding */
+                SDL_BlitSurface(text_surface, NULL, pdc_screen, &dest);
+                SDL_FreeSurface(text_surface);
+            }
+
+            /* Draw underline to indicate composition state */
+            SDL_Rect underline = {dest.x - 2, dest.y + pdc_fheight - 2, text_width + 4, 2};
+            SDL_FillRect(pdc_screen, &underline,
+                         SDL_MapRGB(pdc_screen->format, fg_color.r, fg_color.g, fg_color.b));
+
+            /* Remember for next time */
+            last_composition_width = text_width + 4;
+            last_cursor_x = cursor_x;
+            last_cursor_y = cursor_y;
+        }
+        else
+        {
+            last_composition_width = 0;
+        }
+    }
+#endif
+}
+
 void PDC_doupdate(void)
 {
+    static int window_shown = 0;
+
     PDC_update_rects();
+
+    /* Render IME composition overlay if active */
+    _render_composition_overlay();
+
+    /* Force immediate screen update to ensure IME input is visible */
+    SDL_UpdateWindowSurface(pdc_window);
+
+    /* Show window after first update to avoid black screen on startup */
+    if (!window_shown)
+    {
+        SDL_ShowWindow(pdc_window);
+        window_shown = 1;
+    }
 }
 
 void PDC_pump_and_peep(void)

@@ -112,6 +112,38 @@ addch
 
 **man-end****************************************************************/
 
+#ifdef PDC_WIDE
+/* Check if a Unicode code point is a wide (CJK) character that needs 2 cells */
+static int _pdc_is_wide_char(chtype ch)
+{
+    unsigned long cmp = (unsigned long)(ch & A_CHARTEXT);
+
+    /* East Asian Wide and Fullwidth characters */
+    if (cmp >= 0x1100 &&
+        (cmp <= 0x115f ||                    /* Hangul Jamo init. consonants */
+         cmp == 0x2329 ||
+         cmp == 0x232a ||
+         (cmp >= 0x2e80 && cmp <= 0x4dbf &&
+          cmp != 0x303f) ||                  /* CJK ... Yi */
+         (cmp >= 0x4e00 && cmp <= 0xa4cf) || /* CJK Unified Ideographs, Yi */
+         (cmp >= 0xa960 && cmp <= 0xa97f) || /* Hangul Jamo Extended-A */
+         (cmp >= 0xac00 && cmp <= 0xd7a3) || /* Hangul Syllables */
+         (cmp >= 0xf900 && cmp <= 0xfaff) || /* CJK Compatibility Ideographs */
+         (cmp >= 0xfe10 && cmp <= 0xfe19) || /* Vertical forms */
+         (cmp >= 0xfe30 && cmp <= 0xfe6f) || /* CJK Compatibility Forms */
+         (cmp >= 0xff00 && cmp <= 0xff60) || /* Fullwidth Forms */
+         (cmp >= 0xffe0 && cmp <= 0xffe6) ||
+         (cmp >= 0x20000 && cmp <= 0x2fffd) ||
+         (cmp >= 0x30000 && cmp <= 0x3fffd))) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Placeholder for the second cell of a wide character */
+#define PDC_WIDE_PLACEHOLDER 0
+#endif
+
 int waddch(WINDOW *win, const chtype ch)
 {
     int x, y;
@@ -241,6 +273,40 @@ int waddch(WINDOW *win, const chtype ch)
 
             win->_y[y][x] = text;
         }
+
+#ifdef PDC_WIDE
+        /* For wide (CJK) characters, place a placeholder in the next cell */
+        if (_pdc_is_wide_char(ch))
+        {
+            if (++x < win->_maxx)
+            {
+                /* Place placeholder in second cell */
+                if (win->_y[y][x] != (PDC_WIDE_PLACEHOLDER | attr))
+                {
+                    if (win->_firstch[y] == _NO_CHANGE)
+                        win->_firstch[y] = win->_lastch[y] = x;
+                    else if (x > win->_lastch[y])
+                        win->_lastch[y] = x;
+
+                    win->_y[y][x] = PDC_WIDE_PLACEHOLDER | attr;
+                }
+            }
+            else
+            {
+                /* Wide char at end of line - need to wrap */
+                x = 0;
+                if (++y > win->_bmarg)
+                {
+                    y--;
+                    if (wscrl(win, 1) == ERR)
+                    {
+                        PDC_sync(win);
+                        return ERR;
+                    }
+                }
+            }
+        }
+#endif
 
         if (++x >= win->_maxx)
         {

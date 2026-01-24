@@ -36,6 +36,7 @@ SDL_Color pdc_color[PDC_MAXCOL];
 Uint32 pdc_mapped[PDC_MAXCOL];
 int pdc_fheight, pdc_fwidth, pdc_fthick, pdc_flastc;
 bool pdc_own_window;
+static bool pdc_window_created_by_us = false;  /* Remember if we created the window */
 
 static void _clean(void)
 {
@@ -164,9 +165,16 @@ int PDC_scr_open(void)
 
     PDC_LOG(("PDC_scr_open() - called\n"));
 
-    pdc_own_window = !pdc_window;
+    /* Determine if we own the window: TRUE if we created it or if no window exists yet */
+    if (!pdc_window) {
+        pdc_window_created_by_us = true;
+        pdc_own_window = true;
+    } else {
+        /* Window already exists - use remembered flag */
+        pdc_own_window = pdc_window_created_by_us;
+    }
 
-    if (pdc_own_window)
+    if (pdc_own_window && !SDL_WasInit(SDL_INIT_VIDEO))
     {
         if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER|SDL_INIT_EVENTS) < 0)
         {
@@ -182,7 +190,8 @@ int PDC_scr_open(void)
 #ifdef PDC_WIDE
     if (!pdc_ttffont)
     {
-        const char *ptsz, *fname;
+        const char *ptsz, *fname, *pidx;
+        int font_index = 0;
 
         if (TTF_Init() == -1)
         {
@@ -196,9 +205,14 @@ int PDC_scr_open(void)
         if (pdc_font_size <= 0)
             pdc_font_size = 18;
 
+        /* PDC_FONT_INDEX: index for TTC font collections (default: 0) */
+        pidx = getenv("PDC_FONT_INDEX");
+        if (pidx != NULL)
+            font_index = atoi(pidx);
+
         fname = getenv("PDC_FONT");
-        pdc_ttffont = TTF_OpenFont(fname ? fname : PDC_FONT_PATH,
-                                   pdc_font_size);
+        pdc_ttffont = TTF_OpenFontIndex(fname ? fname : PDC_FONT_PATH,
+                                        pdc_font_size, font_index);
     }
 
     if (!pdc_ttffont)
@@ -267,7 +281,7 @@ int PDC_scr_open(void)
                                                     sizeof(iconbmp)), 0);
     }
 
-    if (pdc_own_window)
+    if (pdc_own_window && !pdc_window)
     {
         const char *env = getenv("PDC_LINES");
         pdc_sheight = (env ? atoi(env) : 25) * pdc_fheight;
@@ -275,10 +289,13 @@ int PDC_scr_open(void)
         env = getenv("PDC_COLS");
         pdc_swidth = (env ? atoi(env) : 80) * pdc_fwidth;
 
+        /* Enable native IME UI (candidate window) - must be set before window creation */
+        SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
+
         pdc_window = SDL_CreateWindow("PDCurses",
-            SDL_WINDOWPOS_CENTERED_DISPLAY(displaynum),
-            SDL_WINDOWPOS_CENTERED_DISPLAY(displaynum),
-            pdc_swidth, pdc_sheight, SDL_WINDOW_RESIZABLE);
+            SDL_WINDOWPOS_UNDEFINED_DISPLAY(displaynum),
+            SDL_WINDOWPOS_UNDEFINED_DISPLAY(displaynum),
+            pdc_swidth, pdc_sheight, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
 
         if (pdc_window == NULL)
         {
@@ -287,6 +304,14 @@ int PDC_scr_open(void)
         }
 
         SDL_SetWindowIcon(pdc_window, pdc_icon);
+    }
+    else if (pdc_own_window && pdc_window)
+    {
+        /* Window already exists - get current size */
+        int w, h;
+        SDL_GetWindowSize(pdc_window, &w, &h);
+        pdc_swidth = w;
+        pdc_sheight = h;
     }
 
     /* Events must be pumped before calling SDL_GetWindowSurface, or
@@ -301,16 +326,14 @@ int PDC_scr_open(void)
             SDL_WINDOWEVENT_EXPOSED == event.window.event)
             break;
 
+    /* Always refresh the window surface (it may have changed if window was resized) */
+    pdc_screen = SDL_GetWindowSurface(pdc_window);
+
     if (!pdc_screen)
     {
-        pdc_screen = SDL_GetWindowSurface(pdc_window);
-
-        if (!pdc_screen)
-        {
-            fprintf(stderr, "Could not open SDL window surface: %s\n",
-                    SDL_GetError());
-            return ERR;
-        }
+        fprintf(stderr, "Could not open SDL window surface: %s\n",
+                SDL_GetError());
+        return ERR;
     }
 
     if (!pdc_sheight)
@@ -345,29 +368,87 @@ int PDC_scr_open(void)
 
 int PDC_resize_screen(int nlines, int ncols)
 {
+    fprintf(stderr, "PDC_resize_screen() called: nlines=%d, ncols=%d\n", nlines, ncols);
+
     if (!pdc_own_window)
         return ERR;
 
-    if (nlines && ncols)
+    if (nlines == 0 && ncols == 0)
     {
+        /* Get current window size and update pdc_sheight/pdc_swidth */
+        int w, h;
+        SDL_GetWindowSize(pdc_window, &w, &h);
+        pdc_swidth = w;
+        pdc_sheight = h;
+        pdc_screen = SDL_GetWindowSurface(pdc_window);
+        fprintf(stderr, "PDC_resize_screen: window size=%dx%d, pdc_size=%dx%d\n",
+                w, h, pdc_swidth, pdc_sheight);
+    }
+    else if (nlines && ncols)
+    {
+        /* Don't resize/reposition if window is maximized - it would un-maximize */
+        Uint32 flags = SDL_GetWindowFlags(pdc_window);
+        bool is_maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+
+        if (!is_maximized)
+        {
 #if SDL_VERSION_ATLEAST(2, 0, 5)
-        SDL_Rect max;
-        int top, left, bottom, right;
+            SDL_Rect usable;
+            int top, left, bottom, right;
+            int displayIndex = SDL_GetWindowDisplayIndex(pdc_window);
+            int client_max_w, client_max_h;
 
-        SDL_GetDisplayUsableBounds(0, &max);
-        SDL_GetWindowBordersSize(pdc_window, &top, &left, &bottom, &right);
-        max.h -= top + bottom;
-        max.w -= left + right;
+            if (displayIndex < 0)
+                displayIndex = 0;
 
-        while (nlines * pdc_fheight > max.h)
-            nlines--;
-        while (ncols * pdc_fwidth > max.w)
-            ncols--;
+            SDL_GetDisplayUsableBounds(displayIndex, &usable);
+            SDL_GetWindowBordersSize(pdc_window, &top, &left, &bottom, &right);
+
+            /* Calculate maximum client area size */
+            client_max_w = usable.w - left - right;
+            client_max_h = usable.h - top - bottom;
+
+            while (nlines * pdc_fheight > client_max_h)
+                nlines--;
+            while (ncols * pdc_fwidth > client_max_w)
+                ncols--;
 #endif
-        pdc_sheight = nlines * pdc_fheight;
-        pdc_swidth = ncols * pdc_fwidth;
+            pdc_sheight = nlines * pdc_fheight;
+            pdc_swidth = ncols * pdc_fwidth;
 
-        SDL_SetWindowSize(pdc_window, pdc_swidth, pdc_sheight);
+            SDL_SetWindowSize(pdc_window, pdc_swidth, pdc_sheight);
+
+#if SDL_VERSION_ATLEAST(2, 0, 5)
+            /* Adjust window position to stay within screen bounds */
+            {
+                int x, y;
+                int win_w = pdc_swidth + left + right;
+                int win_h = pdc_sheight + top + bottom;
+
+                SDL_GetWindowPosition(pdc_window, &x, &y);
+
+                /* Ensure window is within usable bounds */
+                if (x < usable.x)
+                    x = usable.x;
+                if (y < usable.y)
+                    y = usable.y;
+                if (x + win_w > usable.x + usable.w)
+                    x = usable.x + usable.w - win_w;
+                if (y + win_h > usable.y + usable.h)
+                    y = usable.y + usable.h - win_h;
+
+                SDL_SetWindowPosition(pdc_window, x, y);
+            }
+#endif
+        }
+        else
+        {
+            /* Window is maximized - just update internal sizes from current window */
+            int w, h;
+            SDL_GetWindowSize(pdc_window, &w, &h);
+            pdc_swidth = w;
+            pdc_sheight = h;
+        }
         pdc_screen = SDL_GetWindowSurface(pdc_window);
     }
 
