@@ -29,6 +29,10 @@ extern bool pdc_own_window;          /* if pdc_window was not set
                                         before initscr(), PDCurses is
                                         responsible for (owns) it */
 
+/* IME composition text support */
+extern char pdc_composition_text[256];  /* current composition (editing) text */
+extern int pdc_composition_cursor;      /* cursor position within composition */
+
 PDCEX  void PDC_update_rects(void);
 PDCEX  void PDC_retile(void);
 

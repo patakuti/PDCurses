@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.a
+*.lib
+*.dll
+*.exe
+*.so
+*.dylib
+
+# Platform-specific build outputs
+dos/*.exe
+dosvga/*.exe
+os2/*.exe
+sdl1/*.exe
+sdl2/*.exe
+vt/*.exe
+wingui/*.exe
+wincon/*.exe
+x11/*.exe

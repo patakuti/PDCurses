@@ -9,6 +9,10 @@ static SDL_Event event;
 static SDL_Keycode oldkey;
 static MOUSE_STATUS old_mouse_status;
 
+/* IME composition text storage */
+char pdc_composition_text[256] = "";
+int pdc_composition_cursor = 0;
+
 static struct
 {
     SDL_Keycode keycode;
@@ -224,6 +228,10 @@ static int _process_key_event(void)
     }
     else if (event.type == SDL_TEXTINPUT)
     {
+        /* Clear composition text when input is confirmed */
+        pdc_composition_text[0] = '\0';
+        pdc_composition_cursor = 0;
+
 #ifdef PDC_WIDE
         if ((key = _utf8_to_unicode(event.text.text, &bytes)) == -1)
         {
@@ -241,6 +249,17 @@ static int _process_key_event(void)
                 strlen(event.text.text));
         return key > 0x7f ? -1 : _handle_alt_keys(key);
 #endif
+    }
+    else if (event.type == SDL_TEXTEDITING)
+    {
+        /* Store IME composition text for overlay display */
+        strncpy(pdc_composition_text, event.edit.text, sizeof(pdc_composition_text) - 1);
+        pdc_composition_text[sizeof(pdc_composition_text) - 1] = '\0';
+        pdc_composition_cursor = event.edit.start;
+
+        /* Trigger screen update to show composition */
+        PDC_doupdate();
+        return -1;
     }
 
     oldkey = event.key.keysym.sym;
@@ -417,8 +436,10 @@ int PDC_get_key(void)
         if (SDL_WINDOWEVENT_SIZE_CHANGED == event.window.event)
         {
             pdc_screen = SDL_GetWindowSurface(pdc_window);
-            pdc_sheight = pdc_screen->h - pdc_xoffset;
-            pdc_swidth = pdc_screen->w - pdc_yoffset;
+            pdc_sheight = pdc_screen->h - pdc_yoffset;
+            pdc_swidth = pdc_screen->w - pdc_xoffset;
+            fprintf(stderr, "PDC: SDL_WINDOWEVENT_SIZE_CHANGED: screen=%dx%d, pdc_size=%dx%d, SP->resized=%d\n",
+                    pdc_screen->w, pdc_screen->h, pdc_swidth, pdc_sheight, SP->resized);
             touchwin(curscr);
             wrefresh(curscr);
 
@@ -426,8 +447,10 @@ int PDC_get_key(void)
             {
                 SP->resized = TRUE;
                 SP->key_code = TRUE;
+                fprintf(stderr, "PDC: Returning KEY_RESIZE\n");
                 return KEY_RESIZE;
             }
+            fprintf(stderr, "PDC: SP->resized already TRUE, not returning KEY_RESIZE\n");
         }
         break;
     case SDL_MOUSEMOTION:
@@ -440,6 +463,7 @@ int PDC_get_key(void)
     case SDL_KEYUP:
     case SDL_KEYDOWN:
     case SDL_TEXTINPUT:
+    case SDL_TEXTEDITING:
         PDC_mouse_set();
         return _process_key_event();
     case SDL_USEREVENT:
